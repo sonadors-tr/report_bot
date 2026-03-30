@@ -37,10 +37,65 @@ TASLAK_PATH    = "MONTAJ_RAPORU_TASLAK.docx"  # bot ile aynı klasörde olmalı
 OUTPUT_DIR     = Path("raporlar")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+BACKUP_DIR = Path("backups")
+BACKUP_DIR.mkdir(exist_ok=True)
+
 # ══════════════════════════════════════════════
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 openai_client = openai.AsyncOpenAI(api_key=OPENAI_KEY)
+
+
+# ──────────────────────────────────────────────
+#  BACKUP SİSTEMİ
+# ──────────────────────────────────────────────
+def backup_kaydet(uid: int, s: dict):
+    """Her değişiklikte oturumu JSON dosyasına yazar."""
+    try:
+        # Fotoğraf bytes'ları JSON'a yazılamaz, base64'e çevir
+        import base64, copy as _copy
+        s_clean = _copy.deepcopy(s)
+        for a in s_clean.get("aksalik", []):
+            a["fotograflar"] = [base64.b64encode(b).decode() for b in a.get("fotograflar", [])]
+        s_clean.pop("_pending_photos", None)
+        s_clean.pop("_pending_fmt", None)
+        s_clean.pop("_pending_text", None)
+        s_clean.pop("_mod", None)
+        path = BACKUP_DIR / f"session_{uid}.json"
+        with open(path, "w", encoding="utf-8") as f:
+            import json as _json
+            _json.dump(s_clean, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"Backup hatası: {e}")
+
+def backup_yukle(uid: int) -> dict | None:
+    """Kaydedilmiş oturumu yükler."""
+    try:
+        import base64, json as _json
+        path = BACKUP_DIR / f"session_{uid}.json"
+        if not path.exists():
+            return None
+        with open(path, encoding="utf-8") as f:
+            s = _json.load(f)
+        # base64 fotoğrafları geri bytes'a çevir
+        for a in s.get("aksalik", []):
+            a["fotograflar"] = [base64.b64decode(b) for b in a.get("fotograflar", [])]
+        # Eksik alanları varsayılanla doldur
+        s.setdefault("_mod", None)
+        s.setdefault("_pending_fmt", None)
+        s.setdefault("_pending_text", "")
+        s.setdefault("_pending_photos", [])
+        return s
+    except Exception as e:
+        log.warning(f"Backup yükleme hatası: {e}")
+        return None
+
+def backup_sil(uid: int):
+    try:
+        path = BACKUP_DIR / f"session_{uid}.json"
+        if path.exists():
+            path.unlink()
+    except: pass
 
 GUNLER = {
     "Monday":"Pazartesi","Tuesday":"Salı","Wednesday":"Çarşamba",
@@ -80,8 +135,15 @@ def yeni_oturum() -> dict:
 sessions: dict[int, dict] = {}
 def get_session(uid: int) -> dict:
     if uid not in sessions:
-        sessions[uid] = yeni_oturum()
+        # Önce backup'tan yüklemeyi dene
+        saved = backup_yukle(uid)
+        sessions[uid] = saved if saved else yeni_oturum()
     return sessions[uid]
+
+def kaydet_ve_backup(uid: int):
+    """Oturumu hafızada tutar + diske yazar."""
+    if uid in sessions:
+        backup_kaydet(uid, sessions[uid])
 
 
 # ──────────────────────────────────────────────
@@ -93,19 +155,31 @@ async def transcribe(path: str) -> str:
             model="whisper-1", file=f, language="tr")
     return r.text
 
-SISTEM_GUNLUK = f"""Sen montaj sahası rapor asistanısın. Bugünün tarihi: {bugun()}.
+SISTEM_GUNLUK = f"""Sen montaj sahası rapor asistanısın. Bugünün tarihi: {{bugun()}}.
 Kullanıcının anlattığı günü JSON olarak döndür. SADECE JSON yaz, başka hiçbir şey.
-{{
+{{{{
   "tarih": "GG.AA.YYYY",
   "maddeler": ["madde 1", "madde 2"],
   "calisma_saati": "08:00-18:00",
   "fazla_mesai": ""
-}}
-Tarih söylenmemişse BUGÜNÜN tarihini yaz: {bugun()}
-Saatler söylenmemişse "08:00-18:00" yaz. Her işi ayrı madde yap."""
+}}}}
+ÖNEMLİ KURALLAR:
+- Kullanıcının cümlelerini AYNEN koru, kelime değiştirme
+- Sadece yazım hatalarını düzelt
+- Virgülle ayrılmış işleri ayrı maddelere böl
+- Tarih söylenmemişse BUGÜNÜN tarihini yaz: {{bugun()}}
+- Saatler söylenmemişse "08:00-18:00" yaz"""
 
-SISTEM_AKSALIK = "Montaj sahasındaki aksaklığı kısa ve net Türkçe teknik cümle olarak yaz. SADECE açıklama, başka hiçbir şey."
-SISTEM_LISTE   = "Metni kısa Türkçe maddelere çevir. Her madde ayrı satırda. Numara veya tire koyma."
+SISTEM_AKSALIK = """Kullanıcının yazdığı metni AYNEN koru. Sadece şunları yap:
+1. Açık yazım/imla hatalarını düzelt (ör: "gerekşrke" → "gerekirken")
+2. Cümle anlamını, kelimelerini, teknik terimleri ASLA değiştirme
+3. Virgülle ayrılmış birden fazla sorun varsa her birini ayrı cümle yap
+4. SADECE düzeltilmiş metni döndür, açıklama ekleme"""
+SISTEM_LISTE   = """Kullanıcının yazdığı metni AYNEN koru. Sadece şunları yap:
+1. Açık yazım/imla hatalarını düzelt
+2. Virgülle ayrılmış maddeler varsa her birini ayrı satıra al
+3. Kelimeleri, anlamı, teknik terimleri ASLA değiştirme
+4. Her maddeyi ayrı satırda yaz, numara veya tire ekleme"""
 
 SISTEM_TOPLU = """Sen deneyimli bir montaj sahası rapor asistanısın.
 Kullanıcı sana bir tarih aralığı ve o süreçte yapılan işlerin genel bir özetini verecek.
@@ -627,7 +701,23 @@ def onay_kb():
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    sessions.pop(uid, None); get_session(uid)
+    # Eğer aktif oturum varsa yeniden başlatma — /sifirla kullan
+    if uid in sessions and (sessions[uid].get("gunluk") or sessions[uid].get("aksalik")):
+        s = sessions[uid]
+        await update.message.reply_text(
+            f"⚠️ Devam eden rapor var! (Günlük: {len(s['gunluk'])}, Aksaklık: {len(s['aksalik'])})\n"
+            "Sıfırlamak için /sifirla, devam etmek için menüyü kullanın.",
+            reply_markup=ana_menu())
+        return
+    sessions.pop(uid, None)
+    s = get_session(uid)  # backup varsa yükler
+    if s.get("gunluk") or s.get("aksalik"):
+        await update.message.reply_text(
+            f"♻️ Kaydedilmiş rapor bulundu ve yüklendi!\n"
+            f"Firma: {s['firma'] or '—'}  |  Günlük: {len(s['gunluk'])} gün\n"
+            "Devam edebilirsiniz.",
+            reply_markup=ana_menu())
+        return
     await update.message.reply_text(
         "👷 *Montaj Rapor Botuna Hoş Geldiniz!*\n\n"
         "1️⃣ Önce /ayarla ile proje bilgilerini girin\n"
@@ -637,9 +727,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown", reply_markup=ana_menu())
 
 async def cmd_ayarla(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    get_session(update.effective_user.id)["_mod"] = "setup"
+    s = get_session(update.effective_user.id)
+    s["_mod"] = "setup"
+    # Mevcut değerleri göster
+    mevcut = (
+        f"Mevcut bilgiler:\n"
+        f"IS_EMRI: {s['is_emri'] or '—'}\n"
+        f"FIRMA: {s['firma'] or '—'}\n"
+        f"FOREMEN: {s['foremen'] or '—'}\n\n"
+    ) if any([s['is_emri'], s['firma'], s['foremen']]) else ""
     await update.message.reply_text(
-        "Proje bilgilerini şu formatta gönderin:\n\n"
+        f"{mevcut}"
+        "Güncellemek istediğiniz alanları yazın (sadece değiştirilecekler, rapor verisi silinmez):\n\n"
         "`IS_EMRI: 2025025\n"
         "FIRMA: Palkana\n"
         "ULKE_SEHIR: Irak/Süleymaniye\n"
@@ -678,8 +777,11 @@ async def cmd_ozet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=ana_menu())
 
 async def cmd_sifirla(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    sessions.pop(update.effective_user.id, None); get_session(update.effective_user.id)
-    await update.message.reply_text("🔄 Yeni rapor başlatıldı!", reply_markup=ana_menu())
+    uid = update.effective_user.id
+    sessions.pop(uid, None)
+    backup_sil(uid)
+    get_session(uid)
+    await update.message.reply_text("🔄 Yeni rapor başlatıldı! Eski veriler silindi.", reply_markup=ana_menu())
 
 
 # ──────────────────────────────────────────────
@@ -709,8 +811,10 @@ async def isle_metin(uid: int, text: str, update: Update):
             elif "KONTROL:"   in u: s["kontrol_eden"]= v
             elif "ONAYLAYAN:" in u: s["onaylayan"]  = v
         s["_mod"] = None
+        kaydet_ve_backup(update.effective_user.id)  # ← ayarlar değişince backup
         await update.message.reply_text(
-            f"✅ Kaydedildi! Firma: {s['firma']}  |  Foremen: {s['foremen']}",
+            f"✅ Güncellendi! Firma: {s['firma']}  |  Foremen: {s['foremen']}\n"
+            f"(Rapor verileri korundu — Günlük: {len(s['gunluk'])}, Aksaklık: {len(s['aksalik'])})",
             reply_markup=ana_menu())
         return
 
@@ -926,7 +1030,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if mod == "toplu" and isinstance(fmt, list) and fmt and isinstance(fmt[0], dict):
             s["gunluk"].extend(fmt)
-            # Tarihe göre sırala
             from datetime import datetime as _dt
             s["gunluk"].sort(key=lambda x: _dt.strptime(x.get("tarih", "01.01.2000"), "%d.%m.%Y"))
             await query.edit_message_text(
@@ -956,6 +1059,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ Onaylanacak veri yok.", reply_markup=ana_menu())
 
         s["_mod"] = None; s["_pending_fmt"] = None; s["_pending_text"] = ""
+        kaydet_ve_backup(uid)  # ← her onaydan sonra diske yaz
         return
 
     if data == "cancel":
