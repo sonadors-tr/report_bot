@@ -31,8 +31,8 @@ from lxml import etree
 # ══════════════════════════════════════════════
 #  YAPILANDIRMA
 # ══════════════════════════════════════════════
-TELEGRAM_TOKEN = "TELEGRAM_TOKEN"
-OPENAI_KEY     = "OPENAI_KEY"   # sk-... ile başlar
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_KEY     = os.getenv("OPENAI_KEY")   # sk-... ile başlar
 TASLAK_PATH    = "MONTAJ_RAPORU_TASLAK.docx"  # bot ile aynı klasörde olmalı
 OUTPUT_DIR     = Path("raporlar")
 OUTPUT_DIR.mkdir(exist_ok=True)
