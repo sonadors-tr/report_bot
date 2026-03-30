@@ -301,10 +301,13 @@ def build_docx(s: dict) -> str:
     if len(all_tables) > 2:
         tablo_hucre_yaz(all_tables[2], 0, 1, s["foremen"])
 
-    # Tablo 3: Personel
+    # Tablo 3: Personel - her isim ayrı satıra (satır 1-5, sol sütun)
     if len(all_tables) > 3:
-        personel_txt = "\n".join(s["personel"])
-        tablo_hucre_yaz(all_tables[3], 0, 1, personel_txt)
+        t3 = all_tables[3]
+        for pi, isim in enumerate(s["personel"][:5]):  # max 5 kişi
+            row_idx = pi + 1  # 0. satır başlık, 1'den başla
+            if row_idx < len(t3.rows):
+                tablo_hucre_yaz(t3, row_idx, 0, isim)
 
     # Tablo 4: Başlangıç/Bitiş tarihleri
     if len(all_tables) > 4:
@@ -313,15 +316,15 @@ def build_docx(s: dict) -> str:
             tablo_hucre_yaz(t, 0, 1, s["baslangic"])
             tablo_hucre_yaz(t, 0, 3, s["bitis"])
 
-    # Tablo 5: Adam gün / bitirme oranı
+    # Tablo 5: Adam gün / bitirme oranı (satır 1=gerçekleşen, satır 2=planlanan)
     if len(all_tables) > 5:
         t = all_tables[5]
-        tablo_hucre_yaz(t, 0, 2, s["gerceklesen"])
-        tablo_hucre_yaz(t, 1, 2, s["planlanan"])
+        tablo_hucre_yaz(t, 1, 2, s["gerceklesen"])
+        tablo_hucre_yaz(t, 2, 2, s["planlanan"])
 
-    # Tablo 6: Tesis tipi
+    # Tablo 6: Tesis tipi — başlık satır 0 col 0, içerik satır 1 col 0
     if len(all_tables) > 6:
-        tablo_hucre_yaz(all_tables[6], 0, 1, s["tesis_tipi"])
+        tablo_hucre_yaz(all_tables[6], 1, 0, s["tesis_tipi"])
 
     # Tablo 7: Notlar
     if len(all_tables) > 7:
@@ -430,13 +433,19 @@ def build_docx(s: dict) -> str:
         yeni_els = []
         yeni_els.append(bos_paragraf())
         
+        # Tarihe göre sırala (eskiden yeniye) — sonradan girilen geçmiş tarihler doğru yere girer
+        sirali_tarihler = sorted(
+            tarih_gruplari.items(),
+            key=lambda x: datetime.strptime(x[0], "%d.%m.%Y") if x[0] else datetime.min
+        )
+
         # Gruplanmış kayıtları sıralı olarak ekle
-        for i, (tarih, grup) in enumerate(tarih_gruplari.items(), 1):
+        for i, (tarih, grup) in enumerate(sirali_tarihler, 1):
             gun = grup.get("gun", gun_adi(tarih))
             baslik = f"{i}.  {tarih} {gun}".strip()
 
-            # Numaralı liste paragrafı (numId=1 şablondan)
-            p_num = yeni_paragraf(baslik, numId="1")
+            # Düz numara — numId yok, Word listesiyle çakışmasın
+            p_num = yeni_paragraf(baslik, bold=True)
             yeni_els.append(p_num)
 
             # Maddeleri ekle (her madde ayrı satırda)
@@ -480,8 +489,8 @@ def build_docx(s: dict) -> str:
 
         yeni_els = [bos_paragraf()]
         for i, a in enumerate(s["aksalik"], 1):
-            # Numaralı madde (numId=3 şablondan)
-            p_num = yeni_paragraf(f"{i}.  {a['aciklama']}", numId="3")
+            # Düz numara — numId yok
+            p_num = yeni_paragraf(f"{i}.  {a['aciklama']}")
             yeni_els.append(p_num)
 
             # Fotoğraflar
