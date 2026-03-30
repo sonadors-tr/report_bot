@@ -107,6 +107,22 @@ Saatler söylenmemişse "08:00-18:00" yaz. Her işi ayrı madde yap."""
 SISTEM_AKSALIK = "Montaj sahasındaki aksaklığı kısa ve net Türkçe teknik cümle olarak yaz. SADECE açıklama, başka hiçbir şey."
 SISTEM_LISTE   = "Metni kısa Türkçe maddelere çevir. Her madde ayrı satırda. Numara veya tire koyma."
 
+SISTEM_TOPLU = """Sen deneyimli bir montaj sahası rapor asistanısın.
+Kullanıcı sana bir tarih aralığı ve o süreçte yapılan işlerin genel bir özetini verecek.
+Bu özeti, tarih aralığındaki her gün için ayrı günlük kayıtlara böl.
+Montaj projelerinde tipik iş akışını (hazırlık → yapısal montaj → elektrik → test → devreye alma) göz önünde bulundur.
+Hangi işin hangi güne düşebileceğini mantıklı şekilde dağıt. Hafta sonları da çalışıldığını varsay.
+
+SADECE JSON döndür, başka hiçbir şey yazma:
+[
+  {
+    "tarih": "GG.AA.YYYY",
+    "maddeler": ["madde 1", "madde 2"],
+    "calisma_saati": "08:00-18:00",
+    "fazla_mesai": ""
+  }
+]"""
+
 async def gpt_gunluk(text: str) -> dict:
     r = await openai_client.chat.completions.create(
         model="gpt-4o", max_tokens=600,
@@ -133,6 +149,20 @@ async def gpt_liste(text: str) -> list:
         messages=[{"role":"system","content":SISTEM_LISTE},
                   {"role":"user","content":text}])
     return [l.strip() for l in r.choices[0].message.content.strip().splitlines() if l.strip()]
+
+async def gpt_toplu(tarih_aralik: str, paragraf: str) -> list:
+    """Toplu paragrafı tarih aralığına göre gün gün böler."""
+    prompt = f"Tarih aralığı: {tarih_aralik}\n\nYapılan işler (genel özet):\n{paragraf}"
+    r = await openai_client.chat.completions.create(
+        model="gpt-4o", max_tokens=2000,
+        messages=[{"role":"system","content":SISTEM_TOPLU},
+                  {"role":"user","content":prompt}])
+    raw = r.choices[0].message.content.strip().replace("```json","").replace("```","").strip()
+    gunler = json.loads(raw)
+    for g in gunler:
+        if not g.get("tarih"): continue
+        g["gun"] = gun_adi(g["tarih"])
+    return gunler
 
 
 # ──────────────────────────────────────────────
@@ -572,6 +602,7 @@ def build_docx(s: dict) -> str:
 # ──────────────────────────────────────────────
 MOD_LABELS = {
     "gunluk": "📅 Günlük Kayıt",
+    "toplu":  "📦 Toplu Giriş",
     "aksalik": "⚠️ Aksaklık / Sorun",
     "musteri": "👷 Müşteri Sıkıntısı",
     "oneri":   "💡 Öneri",
@@ -580,6 +611,7 @@ MOD_LABELS = {
 def ana_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Günlük kayıt ekle",     callback_data="mod_gunluk")],
+        [InlineKeyboardButton("📦 Toplu giriş (tarih aralığı)", callback_data="mod_toplu")],
         [InlineKeyboardButton("⚠️ Aksaklık / sorun ekle", callback_data="mod_aksalik")],
         [InlineKeyboardButton("👷 Müşteri sıkıntısı ekle", callback_data="mod_musteri")],
         [InlineKeyboardButton("💡 Öneri ekle",             callback_data="mod_oneri")],
@@ -626,18 +658,17 @@ async def cmd_ayarla(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_kaydet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_session(update.effective_user.id)
-    msg = await update.message.reply_text("📄 Word hazırlanıyor...")
-    try:
-        path = build_docx(s)
-        with open(path, "rb") as f:
-            await update.message.reply_document(
-                document=f, filename=Path(path).name,
-                caption=f"✅ *{s['firma'] or 'Rapor'} — {s['tarih']}*",
-                parse_mode="Markdown")
-        await msg.delete()
-    except Exception as e:
-        log.exception("DOCX hatası")
-        await msg.edit_text(f"❌ Hata: {e}")
+    await update.message.reply_text(
+        f"⚠️ *Montaj tamamlandı mı?*\n\n"
+        f"Firma: {s['firma'] or '—'}\n"
+        f"Günlük kayıt: {len(s['gunluk'])} gün  |  Aksaklık: {len(s['aksalik'])}\n\n"
+        "Raporu Word olarak almak istediğinizden emin misiniz?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Evet, dosyayı al", callback_data="kaydet_onayla"),
+            InlineKeyboardButton("❌ Hayır, devam et", callback_data="kaydet_iptal"),
+        ]])
+    )
 
 async def cmd_ozet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_session(update.effective_user.id)
@@ -703,7 +734,34 @@ async def isle_metin(uid: int, text: str, update: Update):
 
     thinking = await update.message.reply_text("⏳ GPT-4o işliyor...")
     try:
-        if mod == "gunluk":
+        if mod == "toplu":
+            # Tarih aralığını metinden çıkar, geri kalanı paragraf olarak gönder
+            # Format beklentisi: "GG.AA.YYYY - GG.AA.YYYY ... açıklama"
+            import re as _re
+            tarih_pattern = _re.search(r"(\d{2}\.\d{2}\.\d{4})\s*[-–]\s*(\d{2}\.\d{2}\.\d{4})", text)
+            if tarih_pattern:
+                aralik = f"{tarih_pattern.group(1)} - {tarih_pattern.group(2)}"
+                paragraf = text[tarih_pattern.end():].strip() or text
+            else:
+                aralik = f"{bugun()} - {bugun()}"
+                paragraf = text
+
+            gunler = await gpt_toplu(aralik, paragraf)
+            ozet = f"📦 *Toplu giriş — {aralik}*\n_{len(gunler)} güne bölündü:_\n\n"
+            for g in gunler[:5]:  # önizlemede max 5 gün göster
+                ozet += f"📅 *{g.get('tarih','')} {g.get('gun','')}*\n"
+                for m in g.get("maddeler",[])[:2]:
+                    ozet += f"- {m}\n"
+                ozet += "\n"
+            if len(gunler) > 5:
+                ozet += f"_...ve {len(gunler)-5} gün daha_\n"
+            s["_pending_fmt"]  = gunler
+            s["_pending_text"] = text
+            await thinking.edit_text(
+                ozet + "\nOnaylıyor musunuz? (Tüm günler rapora eklenecek)",
+                reply_markup=onay_kb(), parse_mode="Markdown")
+
+        elif mod == "gunluk":
             data = await gpt_gunluk(text)
             gun  = data.get("gun", "")
             ozet = f"📅 *{data.get('tarih','')} {gun}*\n"
@@ -814,6 +872,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         s["_pending_text"]   = ""
         msgs = {
             "gunluk":  "📅 Günlük çalışmayı anlatın (sesli veya yazılı).\nÖrnek: *'Bugün yıkama hattı ring boruları tamamlandı, konveyör montajı yapıldı'*",
+            "toplu":   "📦 *Toplu giriş*\n\nTarih aralığını ve o dönemde yapılan tüm işleri tek paragraf olarak yazın.\n\nÖrnek:\n_02.02.2026 - 13.03.2026 tarihleri arasında yıkama hattı kuruldu, konveyör montajı yapıldı, elektrik bağlantıları tamamlandı, devreye alma testleri yapıldı._\n\nGPT-4o gün gün bölerek rapora ekleyecek.",
             "aksalik": "⚠️ Fotoğraf gönderin (alt yazı olarak açıklama ekleyin)\nveya yazılı/sesli açıklayın.",
             "musteri": "👷 Müşteri kaynaklı sıkıntıları anlatın:",
             "oneri":   "💡 Önerilerinizi anlatın:",
@@ -822,7 +881,22 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "kaydet":
-        await query.edit_message_text("📄 Hazırlanıyor...")
+        # Onay iste
+        await query.edit_message_text(
+            f"⚠️ *Montaj tamamlandı mı?*\n\n"
+            f"Firma: {s['firma'] or '—'}\n"
+            f"Günlük kayıt: {len(s['gunluk'])} gün  |  Aksaklık: {len(s['aksalik'])}\n\n"
+            "Raporu Word olarak almak istediğinizden emin misiniz?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Evet, dosyayı al", callback_data="kaydet_onayla"),
+                InlineKeyboardButton("❌ Hayır, devam et", callback_data="kaydet_iptal"),
+            ]])
+        )
+        return
+
+    if data == "kaydet_onayla":
+        await query.edit_message_text("📄 Word hazırlanıyor...")
         try:
             path = build_docx(s)
             with open(path, "rb") as f:
@@ -830,8 +904,13 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     document=f, filename=Path(path).name,
                     caption=f"✅ *{s['firma'] or 'Rapor'} — {s['tarih']}*",
                     parse_mode="Markdown")
+            await query.message.reply_text("Rapor teslim edildi. Yeni rapor için /sifirla", reply_markup=ana_menu())
         except Exception as e:
             await query.message.reply_text(f"❌ Hata: {e}")
+        return
+
+    if data == "kaydet_iptal":
+        await query.edit_message_text("↩️ Rapora devam ediliyor.", reply_markup=ana_menu())
         return
 
     if data == "ozet":
@@ -845,7 +924,16 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         mod = s.get("_mod") or ""
         fmt = s.get("_pending_fmt")
 
-        if "gunluk" in mod and isinstance(fmt, dict):
+        if mod == "toplu" and isinstance(fmt, list) and fmt and isinstance(fmt[0], dict):
+            s["gunluk"].extend(fmt)
+            # Tarihe göre sırala
+            from datetime import datetime as _dt
+            s["gunluk"].sort(key=lambda x: _dt.strptime(x.get("tarih", "01.01.2000"), "%d.%m.%Y"))
+            await query.edit_message_text(
+                f"✅ Toplu giriş eklendi! {len(fmt)} gün rapora eklendi. (Toplam {len(s['gunluk'])} gün)",
+                reply_markup=ana_menu())
+
+        elif "gunluk" in mod and isinstance(fmt, dict):
             s["gunluk"].append(fmt)
             await query.edit_message_text(f"✅ Günlük eklendi! ({len(s['gunluk'])} gün)", reply_markup=ana_menu())
 
