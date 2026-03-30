@@ -1,0 +1,1 @@
+worker: python montaj_rapor_bot.py
