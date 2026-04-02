@@ -155,20 +155,24 @@ async def transcribe(path: str) -> str:
             model="whisper-1", file=f, language="tr")
     return r.text
 
-SISTEM_GUNLUK = f"""Sen montaj sahası rapor asistanısın. Bugünün tarihi: {{bugun()}}.
+def sistem_gunluk() -> str:
+    """Her çağrıda güncel tarihi içeren sistem promptu döndürür."""
+    bugun_str = bugun()
+    return f"""Sen montaj sahası rapor asistanısın. Bugünün tarihi: {bugun_str}.
 Kullanıcının anlattığı günü JSON olarak döndür. SADECE JSON yaz, başka hiçbir şey.
-{{{{
+{{
   "tarih": "GG.AA.YYYY",
   "maddeler": ["madde 1", "madde 2"],
   "calisma_saati": "08:00-18:00",
   "fazla_mesai": ""
-}}}}
+}}
 ÖNEMLİ KURALLAR:
 - Kullanıcının cümlelerini AYNEN koru, kelime değiştirme
 - Sadece yazım hatalarını düzelt
 - Virgülle ayrılmış işleri ayrı maddelere böl
-- Tarih söylenmemişse BUGÜNÜN tarihini yaz: {{bugun()}}
-- Saatler söylenmemişse "08:00-18:00" yaz"""
+- Tarih söylenmemişse BUGÜNÜN tarihini yaz: {bugun_str}
+- Saatler söylenmemişse "08:00-18:00" yaz
+- Tarih formatı mutlaka GG.AA.YYYY olsun (örnek: 03.04.2026)"""
 
 SISTEM_AKSALIK = """Kullanıcının yazdığı metni AYNEN koru. Sadece şunları yap:
 1. Açık yazım/imla hatalarını düzelt (ör: "gerekşrke" → "gerekirken")
@@ -200,7 +204,7 @@ SADECE JSON döndür, başka hiçbir şey yazma:
 async def gpt_gunluk(text: str) -> dict:
     r = await openai_client.chat.completions.create(
         model="gpt-4o", max_tokens=600,
-        messages=[{"role":"system","content":SISTEM_GUNLUK},
+        messages=[{"role":"system","content":sistem_gunluk()},
                   {"role":"user","content":text}])
     raw = r.choices[0].message.content.strip().replace("```json","").replace("```","").strip()
     data = json.loads(raw)
@@ -1037,8 +1041,22 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=ana_menu())
 
         elif "gunluk" in mod and isinstance(fmt, dict):
-            s["gunluk"].append(fmt)
-            await query.edit_message_text(f"✅ Günlük eklendi! ({len(s['gunluk'])} gün)", reply_markup=ana_menu())
+            # Aynı tarih zaten varsa maddeleri birleştir, yeni kayıt ekleme
+            tarih = fmt.get("tarih", "")
+            mevcut = next((g for g in s["gunluk"] if g.get("tarih") == tarih), None)
+            if mevcut:
+                mevcut["maddeler"].extend(fmt.get("maddeler", []))
+                if fmt.get("calisma_saati"):
+                    mevcut["calisma_saati"] = fmt["calisma_saati"]
+                if fmt.get("fazla_mesai"):
+                    mevcut["fazla_mesai"] = fmt["fazla_mesai"]
+                gun_str = fmt.get("gun", "") or gun_adi(tarih)
+                await query.edit_message_text(
+                    f"✅ {tarih} {gun_str} gününe eklendi! ({len(mevcut['maddeler'])} madde toplam)",
+                    reply_markup=ana_menu())
+            else:
+                s["gunluk"].append(fmt)
+                await query.edit_message_text(f"✅ Günlük eklendi! ({len(s['gunluk'])} gün)", reply_markup=ana_menu())
 
         elif "aksalik" in mod and fmt:
             s["aksalik"].append({"aciklama": fmt, "fotograflar": list(s["_pending_photos"])})
